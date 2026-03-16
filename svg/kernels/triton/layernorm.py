@@ -51,8 +51,8 @@ def _layer_norm_param_fwd_fused(
     # Normalize and apply linear transformation
     x_hat = (x - mean) * rstd
 
-    w = tl.load(W + cols)
-    b = tl.load(B + cols)
+    w = tl.load(W + cols, mask=mask[None, :], other=0.0)
+    b = tl.load(B + cols, mask=mask[None, :], other=0.0)
     
     x_hat = x_hat * w + b
 
