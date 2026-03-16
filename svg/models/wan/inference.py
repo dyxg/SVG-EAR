@@ -6,13 +6,13 @@ from ...logger import logger
 from ..utils import visualize_sparse_bsr
 from .attention import (
     WanAttn_SAPAttn_Processor,
+    WanAttn_EARAttn_Processor,
     WanAttn_SVGAttn_Processor2_0,
     prepare_flashinfer_attention,
     prepare_flexattention,
 )
 from .custom_models import replace_sparse_forward
 from .utils import get_attention_mask, sparsity_to_width
-
 
 def replace_wan_attention(
     pipe,
@@ -36,6 +36,7 @@ def replace_wan_attention(
     kmeans_iter_init=0,
     kmeans_iter_step=0,
     zero_step_kmeans_init=False,
+    min_k_ratio=1,
 ):
 
     context_length = 0  # This seems to be 0 for I2V in SVG
@@ -44,12 +45,10 @@ def replace_wan_attention(
     frame_patches_one_frame = int(height // mod_value) * int(width // mod_value)
 
     dtype = torch.bfloat16  # Or pipe.dtype
-    device = pipe.device
 
     replace_sparse_forward()  # Assuming this is a general patch; if not, it might need to be conditional.
 
     num_layers = len(pipe.transformer.blocks)
-
     if pattern == "SVG":
         AttnModule = WanAttn_SVGAttn_Processor2_0
         AttnModule.num_sampled_rows = num_sampled_rows
@@ -80,7 +79,7 @@ def replace_wan_attention(
                 pipe.transformer.num_attention_heads,
                 pipe.transformer.attention_head_dim,
                 dtype,
-                device,
+                "cuda",
                 context_length,
                 context_length,
                 num_frame_patches,
@@ -99,7 +98,7 @@ def replace_wan_attention(
                 pipe.transformer.num_attention_heads,
                 pipe.transformer.attention_head_dim,
                 dtype,
-                device,
+                "cuda",
                 context_length,
                 context_length,
                 num_frame_patches,
@@ -120,15 +119,25 @@ def replace_wan_attention(
             logger.info("Flashinfer temporal_mask_metadata prepared.")
         else:
             raise ValueError(f"Attention backend {attention_backend} not supported")
-
-        for layer_idx, m in enumerate(pipe.transformer.blocks):
-            if hasattr(m.attn1, "processor"):  # Check if processor exists
-                # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
-                current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
-                current_processor.num_layers = num_layers
-                # Other SVG specific properties already set on AttnModule class can be used or copied if needed
-                m.attn1.set_processor(current_processor)
-
+        
+        if (pipe.transformer_2 is not None):
+            for layer_idx, (m1, m2) in enumerate(zip(pipe.transformer.blocks, pipe.transformer_2.blocks)):
+                if hasattr(m1.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    current_processor.num_layers = num_layers
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m1.attn1.set_processor(current_processor)
+                    m2.attn1.set_processor(current_processor)
+        else:
+            for layer_idx, m in enumerate(pipe.transformer.blocks):
+                if hasattr(m.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    current_processor.num_layers = num_layers
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m.attn1.set_processor(current_processor)
+            
     elif pattern == "SAP":
 
         # Pass K-means specific parameters to the processor's constructor or set them as attributes
@@ -166,13 +175,68 @@ def replace_wan_attention(
         # KMEANS_BLOCK specific params for each instance, passed at init
         # replace_sparse_forward() was called earlier, assuming it's general.
 
-        for layer_idx, m in enumerate(pipe.transformer.blocks):
-            if hasattr(m.attn1, "processor"):  # Check if processor exists
-                # Instantiate KMEANS_BLOCK processor with its specific parameters
-                current_processor = AttnModule(
-                    layer_idx=layer_idx,
-                )
-                m.attn1.set_processor(current_processor)
+        if (pipe.transformer_2 is not None):
+            for layer_idx, (m1, m2) in enumerate(zip(pipe.transformer.blocks, pipe.transformer_2.blocks)):
+                if hasattr(m1.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m1.attn1.set_processor(current_processor)
+                    m2.attn1.set_processor(current_processor)
+        else:
+            for layer_idx, m in enumerate(pipe.transformer.blocks):
+                if hasattr(m.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m.attn1.set_processor(current_processor)
+    elif pattern == "EAR":
+
+        logger.info(
+            f"Configuring KMEANS_BLOCK attention with QC: {num_q_centroids}, KC: {num_k_centroids}, P: {top_p_kmeans}, min_kc_ratio: {min_kc_ratio}"
+        )
+
+        # Make dir and clear the logging file
+        if logging_file is not None:
+            os.makedirs(os.path.dirname(logging_file), exist_ok=True)
+            with open(logging_file, "w") as f:
+                f.write("")
+
+        AttnModule = WanAttn_EARAttn_Processor
+
+        AttnModule.first_layers_fp = first_layers_fp
+        AttnModule.first_times_fp = first_times_fp
+        AttnModule.logging_file = logging_file
+
+        # These might be needed by the processor if it has to adapt to sequence dimensions
+        AttnModule.context_length = context_length
+        AttnModule.num_frame = num_frame_patches
+        AttnModule.frame_size = frame_patches_one_frame
+
+        AttnModule.num_q_centroids = num_q_centroids
+        AttnModule.num_k_centroids = num_k_centroids
+        AttnModule.top_p_kmeans = top_p_kmeans
+        AttnModule.min_kc_ratio = min_kc_ratio
+        AttnModule.num_layers = num_layers
+        AttnModule.kmeans_iter_init = kmeans_iter_init
+        AttnModule.kmeans_iter_step = kmeans_iter_step
+        AttnModule.zero_step_kmeans_init = zero_step_kmeans_init
+        AttnModule.min_k_ratio = min_k_ratio
+        if (pipe.transformer_2 is not None):
+            for layer_idx, (m1, m2) in enumerate(zip(pipe.transformer.blocks, pipe.transformer_2.blocks)):
+                if hasattr(m1.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m1.attn1.set_processor(current_processor)
+                    m2.attn1.set_processor(current_processor)
+        else:
+            for layer_idx, m in enumerate(pipe.transformer.blocks):
+                if hasattr(m.attn1, "processor"):  # Check if processor exists
+                    # Ensure layer_idx is set for SVG processor logic if it relies on it being an instance property after init
+                    current_processor = AttnModule(layer_idx=layer_idx)  # Instantiate with layer_idx
+                    # Other SVG specific properties already set on AttnModule class can be used or copied if needed
+                    m.attn1.set_processor(current_processor)
     else:  # dense or other patterns
         raise ValueError(f"Pattern '{pattern}' not supported")
 

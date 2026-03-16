@@ -12,7 +12,7 @@ license = "Apache-2.0"
 authors = [{ name = "FirstIntelligence" }]
 dependencies = [
     "torch>=2.0.0",
-    "torchvision>=0.15.0",
+    "torchvision==0.24.1",
     "numpy>=1.21.0",
     "scipy>=1.7.0",
     "scikit-learn>=1.0.0",
@@ -20,8 +20,8 @@ dependencies = [
     "tqdm>=4.65.0",
     "matplotlib>=3.5.0",
     "einops>=0.6.0",
-    "diffusers==0.34.0",
-    "transformers>=4.49.2",
+    "diffusers==0.36.0",
+    "transformers==4.57.6",
     "accelerate>=1.7.0",
     "ftfy",
     "imageio",

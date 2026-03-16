@@ -13,6 +13,7 @@ from torch.nn.attention.flex_attention import (
     create_block_mask,
 )
 
+from ...flashinfer_patch import flashinfer_patch_enabled
 from ...logger import logger
 
 
@@ -177,10 +178,12 @@ def gen_temporal_mask(
         f"Flashinfer temporal sparsity: {sparsity * 100:.2f}% | Block size: {row_block_size}x{column_block_size}"
     )
 
-    row_indices = torch.from_numpy(host_row_indices).to(torch.int32).cuda()
+    # BlockSparseAttentionWrapper.plan still stages the metadata on host, so
+    # keep the BSR structure on CPU to avoid an extra GPU->CPU round trip.
+    row_indices = torch.from_numpy(host_row_indices).to(torch.int32)
     # This padding is to avoid irregular memory access in flashinfer kernel
     host_column_indices = np.concatenate((host_column_indices, [0] * 256))
-    column_indices = torch.from_numpy(host_column_indices).to(torch.int32).cuda()
+    column_indices = torch.from_numpy(host_column_indices).to(torch.int32)
 
     return row_indices, column_indices, (row_block_size, column_block_size)
 
@@ -218,19 +221,20 @@ def flashinfer_sparse_attn_forward(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
     bsr_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace)
 
-    bsr_wrapper.plan(
-        row_indices,
-        column_indices,
-        q.shape[0],  # video length
-        k.shape[0],  # video length
-        block_size[0],
-        block_size[1],
-        q.shape[1],  # num_qo_heads
-        k.shape[1],  # num_kv_heads
-        q.shape[2],  # head_dim
-        q_data_type=q.dtype,
-        kv_data_type=k.dtype,
-    )
+    with flashinfer_patch_enabled():
+        bsr_wrapper.plan(
+            row_indices,
+            column_indices,
+            q.shape[0],  # video length
+            k.shape[0],  # video length
+            block_size[0],
+            block_size[1],
+            q.shape[1],  # num_qo_heads
+            k.shape[1],  # num_kv_heads
+            q.shape[2],  # head_dim
+            q_data_type=q.dtype,
+            kv_data_type=k.dtype,
+        )
     o_image = bsr_wrapper.run(q, k, v, return_lse=False)
 
     o_image = o_image.reshape(seq_len, cfg, num_heads, head_dim).permute(1, 2, 0, 3).contiguous()

@@ -35,7 +35,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation")
     parser.add_argument("--skip_existing", action="store_true", help="Skip generating existing output files")
 
-    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP"])
+    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP", "EAR"])
     parser.add_argument("--first_layers_fp", type=float, default=0.025, help="Only works for best config. Leave the 0, 1, 2, 40, 41 layers in FP")
     parser.add_argument("--first_times_fp", type=float, default=0.075, help="Only works for best config. Leave the first 10% timestep in FP")
     
@@ -51,7 +51,6 @@ if __name__ == "__main__":
     parser.add_argument("--min_kc_ratio", type=float, default=0, help="At least this proportion of key blocks to keep per query block in KMEANS_BLOCK.")
     parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in KMEANS_BLOCK.")
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in KMEANS_BLOCK.")
-
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -74,8 +73,6 @@ if __name__ == "__main__":
     scheduler = UniPCMultistepScheduler(prediction_type="flow_prediction", use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
     pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
     pipe.scheduler = scheduler
-    pipe.to("cuda")
-        
     config = pipe.transformer.config
     
     #########################################################
@@ -84,7 +81,6 @@ if __name__ == "__main__":
     ref_scheduler = deepcopy(pipe.scheduler)
     ref_scheduler.set_timesteps(args.num_inference_steps)
     ref_timesteps = ref_scheduler.timesteps
-    
     num_fp_timesteps = math.floor(args.first_times_fp * args.num_inference_steps)
     num_fp_layers = math.floor(args.first_layers_fp * config.num_layers)
     if num_fp_timesteps > 0:
@@ -146,21 +142,41 @@ if __name__ == "__main__":
             kmeans_iter_init=args.kmeans_iter_init,
             kmeans_iter_step=args.kmeans_iter_step,
         )
-
+    elif args.pattern == "EAR":
+        replace_wan_attention(
+            pipe,
+            args.height,
+            args.width,
+            args.num_frames,
+            first_layers_fp=args.first_layers_fp,
+            first_times_fp=args.first_times_fp,
+            pattern=args.pattern,
+            # EAR specific
+            num_q_centroids=args.num_q_centroids,
+            num_k_centroids=args.num_k_centroids,
+            top_p_kmeans=args.top_p_kmeans,
+            min_kc_ratio=args.min_kc_ratio,
+            logging_file=args.logging_file,
+            kmeans_iter_init=args.kmeans_iter_init,
+            kmeans_iter_step=args.kmeans_iter_step,
+        )    
     # Print time logger
     for block in pipe.transformer.blocks:
         block.register_forward_hook(print_operator_log_data)
-
+    pipe.enable_model_cpu_offload()
     #########################################################
     # Generate the video
     #########################################################
-    output = pipe(
-        prompt=args.prompt, negative_prompt=args.negative_prompt, height=args.height, width=args.width, num_frames=args.num_frames, guidance_scale=5.0, num_inference_steps=args.num_inference_steps
-    ).frames[0]
-
+    if ("2.2" in model_id):
+        output = pipe(
+            prompt=args.prompt, negative_prompt=args.negative_prompt, height=args.height, width=args.width, num_frames=args.num_frames, guidance_scale=4.0, guidance_scale_2=3.0, num_inference_steps=args.num_inference_steps
+        ).frames[0]
+    else:
+        output = pipe(
+            prompt=args.prompt, negative_prompt=args.negative_prompt, height=args.height, width=args.width, num_frames=args.num_frames, guidance_scale=5.0, num_inference_steps=args.num_inference_steps
+        ).frames[0]
     # Create parent directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-
     export_to_video(output, args.output_file, fps=16)

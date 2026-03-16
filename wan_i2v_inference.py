@@ -38,7 +38,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation")
     parser.add_argument("--skip_existing", action="store_true", help="Skip generating existing output files")
 
-    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP"])
+    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP", "EAR"])
     parser.add_argument("--first_layers_fp", type=float, default=0.3, help="The percentage of timesteps to leave in FP")
     parser.add_argument("--first_times_fp", type=float, default=0.03, help="The percentage of layers to leave in FP")
     parser.add_argument("--attention_backend", type=str, default="flexattn", choices=["flashinfer", "flexattn"], help="Attention backend to use")
@@ -74,14 +74,16 @@ if __name__ == "__main__":
     # Load the model
     #########################################################
     # Available models: Wan-AI/Wan2.1-I2V-14B-480P-Diffusers, Wan-AI/Wan2.1-I2V-14B-720P-Diffusers
-    assert args.resolution in args.model_id.lower(), "Model's resolution does not match the resolution of the input image"
-    image_encoder = CLIPVisionModel.from_pretrained(args.model_id, subfolder="image_encoder", torch_dtype=torch.float32)
-    vae = AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.float32)
+    # assert args.resolution in args.model_id.lower(), "Model's resolution does not match the resolution of the input image"
+    if ("2.1" in args.model_id.lower()):
+        image_encoder = CLIPVisionModel.from_pretrained(args.model_id, subfolder="image_encoder", torch_dtype=torch.float32)
+        vae = AutoencoderKLWan.from_pretrained(args.model_id, subfolder="vae", torch_dtype=torch.float32)
+        pipe = WanImageToVideoPipeline.from_pretrained(args.model_id, vae=vae, image_encoder=image_encoder, torch_dtype=torch.bfloat16)
+    else:
+        pipe = WanImageToVideoPipeline.from_pretrained(args.model_id, torch_dtype=torch.bfloat16)
     flow_shift = 5.0  # 5.0 for 720P, 3.0 for 480P
     scheduler = UniPCMultistepScheduler(prediction_type="flow_prediction", use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
-    pipe = WanImageToVideoPipeline.from_pretrained(args.model_id, vae=vae, image_encoder=image_encoder, torch_dtype=torch.bfloat16)
     pipe.scheduler = scheduler
-    pipe.to("cuda")
     
     config = pipe.transformer.config
     
@@ -91,7 +93,6 @@ if __name__ == "__main__":
     ref_scheduler = deepcopy(pipe.scheduler)
     ref_scheduler.set_timesteps(args.num_inference_steps)
     ref_timesteps = ref_scheduler.timesteps
-    
     num_fp_timesteps = math.floor(args.first_times_fp * args.num_inference_steps)
     num_fp_layers = math.floor(args.first_layers_fp * config.num_layers)
     if num_fp_timesteps > 0:
@@ -138,7 +139,6 @@ if __name__ == "__main__":
             args.num_frames, 
             first_layers_fp=args.first_layers_fp, 
             first_times_fp=args.first_times_fp,
-            # attention_backend=args.attention_backend,
             pattern=args.pattern,
             # SVG specific
             num_sampled_rows=args.num_sampled_rows,
@@ -153,7 +153,6 @@ if __name__ == "__main__":
             args.num_frames,
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
-            # attention_backend=args.attention_backend,
             pattern=args.pattern,
             # SAP specific
             num_q_centroids=args.num_q_centroids,
@@ -165,12 +164,32 @@ if __name__ == "__main__":
             kmeans_iter_step=args.kmeans_iter_step,
             zero_step_kmeans_init=args.zero_step_kmeans_init,
         )
-
+    elif args.pattern == "EAR":
+        replace_wan_attention(
+            pipe,
+            args.height,
+            args.width,
+            args.num_frames,
+            first_layers_fp=args.first_layers_fp,
+            first_times_fp=args.first_times_fp,
+            pattern=args.pattern,
+            # EAR specific
+            num_q_centroids=args.num_q_centroids,
+            num_k_centroids=args.num_k_centroids,
+            top_p_kmeans=args.top_p_kmeans,
+            min_kc_ratio=args.min_kc_ratio,
+            logging_file=args.logging_file,
+            kmeans_iter_init=args.kmeans_iter_init,
+            kmeans_iter_step=args.kmeans_iter_step,
+            zero_step_kmeans_init=args.zero_step_kmeans_init,
+        )
     # Print time logger
     for block in pipe.transformer.blocks:
         block.register_forward_hook(print_operator_log_data)
         
     print_memory_usage("After replace_wan_attention")
+    
+    pipe.enable_model_cpu_offload()
 
     #########################################################
     # Generate the video
@@ -182,10 +201,9 @@ if __name__ == "__main__":
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
-        guidance_scale=5.0,
+        guidance_scale=3.5,
         num_inference_steps=args.num_inference_steps,
     ).frames[0]
-
     # Create parent directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output_file)
     if output_dir and not os.path.exists(output_dir):
